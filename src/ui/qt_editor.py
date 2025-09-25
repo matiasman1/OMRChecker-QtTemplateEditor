@@ -14,6 +14,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Logger from repo (for explicit error messages)
+try:
+    from src.logger import logger as LOG  # type: ignore
+except Exception:
+    class _DummyLog:
+        def info(self,*a,**k): print(*a)
+        def warning(self,*a,**k): print(*a)
+        def error(self,*a,**k): print(*a)
+    LOG = _DummyLog()  # type: ignore
+
 FIELD_TYPES: Dict[str, Dict[str, Any]] = {}
 try:
     from src.constants import FIELD_TYPES as _FT  # type: ignore
@@ -69,92 +79,29 @@ def parse_csv_or_range(text: str) -> List[str]:
 def to_csv(values: List[str]) -> str:
     return ",".join(values)
 
-# New: import defaults and preprocessors
+# New: import defaults and pipeline (EXACT same modules as main pipeline)
 try:
-    from dotmap import DotMap
-    from src.defaults.config import CONFIG_DEFAULTS
-    from src.utils.parsing import open_config_with_defaults  # NEW
-    from src.processors.CropPage import CropPage
-    from src.processors.CropOnMarkers import CropOnMarkers
-    from src.processors.FeatureBasedAlignment import FeatureBasedAlignment
-    from src.processors.builtins import GaussianBlur as _GaussianBlur, MedianBlur as _MedianBlur, Levels as _Levels
-    from src.template import Template  # NEW
-    from src.utils.image import ImageUtils  # NEW
-except Exception:
-    # Editor should still run without project context (noop fallbacks)
-    DotMap = None
-    CONFIG_DEFAULTS = None
-    open_config_with_defaults = None  # NEW
-    CropPage = CropOnMarkers = FeatureBasedAlignment = object  # type: ignore
+    from src.defaults.config import CONFIG_DEFAULTS  # EXACT import as main
+    from src.utils.parsing import open_config_with_defaults  # EXACT import as main
+    from src.template import Template  # EXACT import as main
+    from src.utils.image import ImageUtils  # EXACT import as main
+    PIPELINE_IMPORT_ERROR: Optional[str] = None
+except Exception as e:
+    # Do NOT silently continue: record why pipeline is unavailable so we can show a clear error
+    PIPELINE_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    LOG.error(
+        "Qt editor failed to import pipeline modules. "
+        f"Reason: {PIPELINE_IMPORT_ERROR}\n"
+        f"Tip: run from the repo root (python -m src.ui.qt_editor ...) and ensure dependencies are installed."
+    )
+    CONFIG_DEFAULTS = None  # type: ignore
+    open_config_with_defaults = None  # type: ignore
     Template = None  # type: ignore
+    ImageUtils = None  # type: ignore
 
-class TemplateModel(QtCore.QObject):
-    changed = QtCore.pyqtSignal()
+# ...existing code...
 
-    def __init__(self, template_path: Path, image_path: Path):
-        super().__init__()
-        self.template_path = template_path
-        self.image_path = image_path
-        self.template: Dict[str, Any] = {}
-        self.load()
-
-    def load(self):
-        try:
-            with open(self.template_path, "r") as f:
-                self.template = json.load(f)
-        except Exception as e:
-            raise SystemExit(f"Failed to load template: {e}")
-
-        self.template.setdefault("fieldBlocks", {})
-        self.template.setdefault("bubbleDimensions", [20, 20])  # [width, height]
-        self.template.setdefault("pageDimensions", [0, 0])
-
-    def field_blocks(self) -> List[Tuple[str, Dict[str, Any]]]:
-        return list(self.template.get("fieldBlocks", {}).items())
-
-    def get_block(self, name: str) -> Dict[str, Any]:
-        return self.template["fieldBlocks"][name]
-
-    def add_block(self, name: str, rect: QtCore.QRectF):
-        # Store rect as origin(x,y), BubblesGap=width, LabelsGap=height (matches existing template usage)
-        fb = {
-            "origin": [int(rect.left()), int(rect.top())],
-            "bubblesGap": int(max(30, rect.width())),
-            "labelsGap": int(max(30, rect.height())),
-            "direction": "horizontal",
-            "fieldLabels": ["q1..1"],
-            "bubbleValues": ["A", "B", "C", "D"],
-        }
-        self.template["fieldBlocks"][name] = fb
-        self.changed.emit()
-
-    def remove_block(self, name: str):
-        if name in self.template["fieldBlocks"]:
-            del self.template["fieldBlocks"][name]
-            self.changed.emit()
-
-    def next_block_name(self, prefix="MCQ_Block_Q") -> str:
-        i = 1
-        existing = set(self.template["fieldBlocks"].keys())
-        while f"{prefix}{i}" in existing:
-            i += 1
-        return f"{prefix}{i}"
-
-    def save_as_edited(self) -> Path:
-        out = self.template_path.with_name(self.template_path.stem + ".edited.json")
-        with open(out, "w") as f:
-            json.dump(self.template, f, indent=2)
-        return out
-
-# New: minimal image-instance ops to satisfy processors
-class _DummyImageInstanceOps:
-    def __init__(self, tuning_config):
-        self.tuning_config = tuning_config
-
-    def append_save_img(self, *args, **kwargs):
-        pass
-
-# New: run template preprocessors without downscaling/blur, like main.py
+# New: run template preprocessors EXACTLY like main.py (apply_preprocessors)
 def run_preprocessors_for_editor(template_path: Path, image_path: Path) -> Optional[np.ndarray]:
     """
     Run preprocessing EXACTLY like the main pipeline:
@@ -168,11 +115,15 @@ def run_preprocessors_for_editor(template_path: Path, image_path: Path) -> Optio
       - For editor overlay consistency, resize the processed image to template.pageDimensions.
     """
     try:
+        # Ensure pipeline imports are available
+        if Template is None or CONFIG_DEFAULTS is None:
+            raise RuntimeError(
+                "Pipeline imports unavailable in Qt editor. "
+                f"{'(Details: ' + PIPELINE_IMPORT_ERROR + ')' if 'PIPELINE_IMPORT_ERROR' in globals() and PIPELINE_IMPORT_ERROR else ''}"
+            )
         img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
         if img is None:
-            return None
-        if Template is None or CONFIG_DEFAULTS is None:
-            return img
+            raise RuntimeError(f"Failed to read image for preprocessing: {image_path}")
 
         # Load tuning config exactly like main (no forced overrides)
         template_dir = template_path.parent
@@ -185,7 +136,10 @@ def run_preprocessors_for_editor(template_path: Path, image_path: Path) -> Optio
         tmpl = Template(template_path, cfg)
         processed = tmpl.image_instance_ops.apply_preprocessors(str(image_path), img, tmpl)
         if processed is None:
-            return None
+            raise RuntimeError(
+                "Preprocessors returned None (cropping/preprocessing failed). "
+                "Ensure your template.json includes CropPage or CropOnMarkers and that inputs are valid."
+            )
 
         # Align preview to template coordinates (same as draw_template_layout does)
         try:
@@ -196,8 +150,10 @@ def run_preprocessors_for_editor(template_path: Path, image_path: Path) -> Optio
             # keep processed as-is if pageDimensions invalid
             pass
         return processed
-    except Exception:
-        return None
+    except Exception as e:
+        LOG.error(f"Qt editor preprocessing error: {e}")
+        # Bubble the error to caller so UI can show a dialog
+        raise
 
 def np_gray_to_qpixmap(img: np.ndarray) -> QtGui.QPixmap:
     h, w = img.shape[:2]
@@ -659,12 +615,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.view.setViewportUpdateMode(QtWidgets.QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate)  # NEW
         self.setCentralWidget(self.view)
 
-        # Load and preprocess image (cropped, no downscale/blur)
-        processed = run_preprocessors_for_editor(template_path, image_path)
-        if processed is not None:
-            pixmap = np_gray_to_qpixmap(processed)
-        else:
+        # Load and preprocess image (EXACT main pipeline). Show explicit errors if it fails.
+        preprocessing_error: Optional[str] = None
+        processed: Optional[np.ndarray] = None
+        try:
+            processed = run_preprocessors_for_editor(template_path, image_path)
+        except Exception as e:
+            preprocessing_error = str(e)
+
+        if processed is None:
+            # Build a helpful message
+            msg_lines = []
+            if 'PIPELINE_IMPORT_ERROR' in globals() and PIPELINE_IMPORT_ERROR:
+                msg_lines.append("Failed to import pipeline modules required for cropping.")
+                msg_lines.append(f"Reason: {PIPELINE_IMPORT_ERROR}")
+                msg_lines.append("Tip: run from repo root and ensure dependencies are installed (e.g., pip install -r requirements.txt).")
+            if preprocessing_error:
+                msg_lines.append(preprocessing_error)
+            if not msg_lines:
+                msg_lines.append("Cropping/preprocessing failed for an unknown reason.")
+            full_msg = "\n".join(msg_lines)
+            LOG.error(full_msg)
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Preprocessing Error",
+                full_msg,
+            )
+            # Fallback to original image so the editor still opens
             pixmap = load_image_as_pixmap(image_path)
+        else:
+            pixmap = np_gray_to_qpixmap(processed)
 
         self.image_item = self.scene.addPixmap(pixmap)
         self.image_item.setZValue(-1000)
