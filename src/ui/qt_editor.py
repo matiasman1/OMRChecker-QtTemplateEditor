@@ -157,13 +157,15 @@ class _DummyImageInstanceOps:
 # New: run template preprocessors without downscaling/blur, like main.py
 def run_preprocessors_for_editor(template_path: Path, image_path: Path) -> Optional[np.ndarray]:
     """
-    - Load config.json if present, else defaults (silenced outputs).
-    - Construct Template and run its preprocessors like main pipeline.
-    - Ensure: crop via corner detection/warping (CropPage/CropOnMarkers) but do NOT blur.
-      We monkey-patch:
-        * GaussianBlur/MedianBlur/Levels -> no-op
-        * CropPage -> custom apply_filter without initial GaussianBlur
-    - Finally resize to template.pageDimensions.
+    Run preprocessing EXACTLY like the main pipeline:
+      - Load config.json (if present) merged over CONFIG_DEFAULTS.
+      - Build Template(template.json, config).
+      - Call Template.image_instance_ops.apply_preprocessors(file_path, image, template),
+        which internally:
+          * resizes to processing_width/height,
+          * applies preProcessors in order (CropPage, CropOnMarkers, blurs, levels, etc.) without overrides,
+          * returns the processed image or None on failure.
+      - For editor overlay consistency, resize the processed image to template.pageDimensions.
     """
     try:
         img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
@@ -172,45 +174,26 @@ def run_preprocessors_for_editor(template_path: Path, image_path: Path) -> Optio
         if Template is None or CONFIG_DEFAULTS is None:
             return img
 
+        # Load tuning config exactly like main (no forced overrides)
         template_dir = template_path.parent
-        # Load tuning config (config.json) if present
         cfg = CONFIG_DEFAULTS
         cfg_path = template_dir / "config.json"
         if open_config_with_defaults is not None and cfg_path.exists():
             cfg = open_config_with_defaults(cfg_path)
-        # Silence outputs
-        cfg.outputs.show_image_level = 0
-        cfg.outputs.save_image_level = 0
 
-        # Build Template from provided template.json
+        # Build Template and run its preprocessors as-is
         tmpl = Template(template_path, cfg)
-
-        # Monkey-patch preprocessors to avoid blur but keep cropping/warping
-        for pp in getattr(tmpl, "pre_processors", []):
-            clsname = pp.__class__.__name__
-            if clsname in ("GaussianBlur", "MedianBlur", "Levels"):
-                def _noop(image, _file_path):
-                    return image
-                pp.apply_filter = _noop  # type: ignore[assignment]
-            elif clsname == "CropPage":
-                def _no_blur_crop(image, file_path, _pp=pp):
-                    sheet = _pp.find_page(image.copy(), file_path)
-                    if len(sheet) == 0:
-                        return None
-                    return ImageUtils.four_point_transform(image, sheet)
-                pp.apply_filter = _no_blur_crop  # type: ignore[assignment]
-            # CropOnMarkers stays unchanged
-
         processed = tmpl.image_instance_ops.apply_preprocessors(str(image_path), img, tmpl)
         if processed is None:
-            processed = img
+            return None
 
-        # Resize to pageDimensions (width, height)
+        # Align preview to template coordinates (same as draw_template_layout does)
         try:
             pw, ph = tmpl.page_dimensions
             if int(pw) > 0 and int(ph) > 0:
                 processed = ImageUtils.resize_util(processed, int(pw), int(ph))
         except Exception:
+            # keep processed as-is if pageDimensions invalid
             pass
         return processed
     except Exception:
