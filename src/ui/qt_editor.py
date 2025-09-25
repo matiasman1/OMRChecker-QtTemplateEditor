@@ -41,6 +41,15 @@ def find_first_image_under(inputs_dir: Path) -> Optional[Path]:
             return p
     return None
 
+def find_first_template_under(inputs_dir: Path) -> Optional[Path]:
+    """Find the first template.json under the given inputs dir (recursively)."""
+    if not inputs_dir.exists():
+        return None
+    for p in sorted(inputs_dir.rglob("template.json")):
+        if p.is_file():
+            return p
+    return None
+
 def parse_csv_or_range(text: str) -> List[str]:
     # e.g., "A,B,C" or "q1..4" -> ["q1","q2","q3","q4"] (kept simple for labels)
     t = text.strip()
@@ -97,7 +106,7 @@ class TemplateModel(QtCore.QObject):
             raise SystemExit(f"Failed to load template: {e}")
 
         self.template.setdefault("fieldBlocks", {})
-        self.template.setdefault("bubbleDimensions", [20, 20])
+        self.template.setdefault("bubbleDimensions", [20, 20])  # [width, height]
         self.template.setdefault("pageDimensions", [0, 0])
 
     def field_blocks(self) -> List[Tuple[str, Dict[str, Any]]]:
@@ -146,12 +155,15 @@ class _DummyImageInstanceOps:
         pass
 
 # New: run template preprocessors without downscaling/blur, like main.py
-def run_preprocessors_for_editor(template_json: Dict[str, Any], image_path: Path, template_dir: Path) -> Optional[np.ndarray]:
+def run_preprocessors_for_editor(template_path: Path, image_path: Path) -> Optional[np.ndarray]:
     """
-    - Load config.json if present, else defaults.
-    - Construct Template and run its preprocessors via ImageInstanceOps.
-    - Force CropPage to skip blur; skip Gaussian/Median/Levels.
-    - Resize to template.pageDimensions for alignment.
+    - Load config.json if present, else defaults (silenced outputs).
+    - Construct Template and run its preprocessors like main pipeline.
+    - Ensure: crop via corner detection/warping (CropPage/CropOnMarkers) but do NOT blur.
+      We monkey-patch:
+        * GaussianBlur/MedianBlur/Levels -> no-op
+        * CropPage -> custom apply_filter without initial GaussianBlur
+    - Finally resize to template.pageDimensions.
     """
     try:
         img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
@@ -160,6 +172,7 @@ def run_preprocessors_for_editor(template_json: Dict[str, Any], image_path: Path
         if Template is None or CONFIG_DEFAULTS is None:
             return img
 
+        template_dir = template_path.parent
         # Load tuning config (config.json) if present
         cfg = CONFIG_DEFAULTS
         cfg_path = template_dir / "config.json"
@@ -169,23 +182,28 @@ def run_preprocessors_for_editor(template_json: Dict[str, Any], image_path: Path
         cfg.outputs.show_image_level = 0
         cfg.outputs.save_image_level = 0
 
-        # Build Template (uses template.json on disk)
-        tmpl = Template(template_dir / "template.json", cfg)
+        # Build Template from provided template.json
+        tmpl = Template(template_path, cfg)
 
-        # Force CropPage skipBlur; skip blurs/levels for editor preview
+        # Monkey-patch preprocessors to avoid blur but keep cropping/warping
         for pp in getattr(tmpl, "pre_processors", []):
             clsname = pp.__class__.__name__
-            if clsname == "CropPage":
-                try:
-                    pp.options["skipBlur"] = True
-                except Exception:
-                    pass
-            elif clsname in ("GaussianBlur", "MedianBlur", "Levels"):
-                pp.apply_filter = lambda image, file_path: image  # type: ignore[attr-defined]
+            if clsname in ("GaussianBlur", "MedianBlur", "Levels"):
+                def _noop(image, _file_path):
+                    return image
+                pp.apply_filter = _noop  # type: ignore[assignment]
+            elif clsname == "CropPage":
+                def _no_blur_crop(image, file_path, _pp=pp):
+                    sheet = _pp.find_page(image.copy(), file_path)
+                    if len(sheet) == 0:
+                        return None
+                    return ImageUtils.four_point_transform(image, sheet)
+                pp.apply_filter = _no_blur_crop  # type: ignore[assignment]
+            # CropOnMarkers stays unchanged
 
         processed = tmpl.image_instance_ops.apply_preprocessors(str(image_path), img, tmpl)
         if processed is None:
-            return img
+            processed = img
 
         # Resize to pageDimensions (width, height)
         try:
@@ -242,49 +260,106 @@ class BlockGraphicsItem(QtWidgets.QGraphicsItem):
         painter.drawText(QtCore.QRectF(self._rect.left()+4, self._rect.top()-16, self._rect.width(), 16),
                          QtCore.Qt.AlignmentFlag.AlignLeft, f"{self.name}")  # CHANGED
 
-        # Bubble preview
-        vals = fb.get("bubbleValues") or []
+        # Bubble preview (grid using bubbleDimensions, gaps, direction, and labels)
+        vals: List[str] = fb.get("bubbleValues") or []
+        labels: List[str] = fb.get("fieldLabels") or []
         if not isinstance(vals, list):
             vals = []
+        if not isinstance(labels, list):
+            labels = []
         bw, bh = fb.get("bubbleDimensions", self.model.template.get("bubbleDimensions", [20, 20]))
-        if not isinstance(bw, (int, float)) or not isinstance(bh, (int, float)):
-            bw, bh = 20, 20
-        # Prefer template spacing from gaps if bubbleSpacing absent
+        try:
+            bw = float(bw)
+            bh = float(bh)
+        except Exception:
+            bw, bh = 20.0, 20.0
         direction = fb.get("direction", "horizontal")
-        spacing = fb.get("bubbleSpacing", None)
-        if spacing is None:
-            spacing = int(fb.get("bubblesGap", 12)) if direction == "horizontal" else int(fb.get("labelsGap", 12))  # CHANGED
-        ox = self._rect.left() + 4
-        oy = self._rect.top() + 4
+        bubbles_gap = int(fb.get("bubblesGap", 12))
+        labels_gap = int(fb.get("labelsGap", 12))
+        base_x = self._rect.left()
+        base_y = self._rect.top()
         painter.setPen(QtGui.QPen(QtGui.QColor(240, 200, 60), 1))
-        for _ in range(len(vals)):
-            cx = ox + bw / 2.0
-            cy = oy + bh / 2.0
-            painter.drawEllipse(QtCore.QPointF(cx, cy), max(2, bw / 2 - 2), max(2, bh / 2 - 2))
-            if direction == "horizontal":
-                ox += bw + spacing
-                if ox + bw > self._rect.right() - 4:
-                    break
-            else:
-                oy += bh + spacing
-                if oy + bh > self._rect.bottom() - 4:
-                    break
+        if direction == "vertical":
+            for li, _lab in enumerate(labels):
+                start_x = base_x + li * labels_gap
+                start_y = base_y
+                for vi, _val in enumerate(vals):
+                    x = start_x
+                    y = start_y + vi * bubbles_gap
+                    rx = x + bw * 0.10
+                    ry = y + bh * 0.10
+                    rw = max(2.0, bw - 2 * bw * 0.10)
+                    rh = max(2.0, bh - 2 * bh * 0.10)
+                    painter.drawRect(QtCore.QRectF(rx, ry, rw, rh))
+        else:
+            for li, _lab in enumerate(labels):
+                start_x = base_x
+                start_y = base_y + li * labels_gap
+                for vi, _val in enumerate(vals):
+                    x = start_x + vi * bubbles_gap
+                    y = start_y
+                    rx = x + bw * 0.10
+                    ry = y + bh * 0.10
+                    rw = max(2.0, bw - 2 * bw * 0.10)
+                    rh = max(2.0, bh - 2 * bh * 0.10)
+                    painter.drawRect(QtCore.QRectF(rx, ry, rw, rh))
 
     def sync_from_model(self):
         fb = self.model.get_block(self.name)
         ox, oy = fb.get("origin", [0, 0])
-        w = int(fb.get("bubblesGap", 120))
-        h = int(fb.get("labelsGap", 60))
+        direction = fb.get("direction", "horizontal")
+        vals: List[str] = fb.get("bubbleValues", []) or []
+        labels: List[str] = fb.get("fieldLabels", []) or []
+        bubbles_gap = int(fb.get("bubblesGap", 12))
+        labels_gap = int(fb.get("labelsGap", 12))
+        bw, bh = fb.get("bubbleDimensions", self.model.template.get("bubbleDimensions", [20, 20]))
+        try:
+            bw = int(bw)
+            bh = int(bh)
+        except Exception:
+            bw, bh = 20, 20
+        n_vals = max(1, len(vals))
+        n_fields = max(1, len(labels))
+        if direction == "vertical":
+            values_dimension = int(bubbles_gap * (n_vals - 1) + bh)
+            fields_dimension = int(labels_gap * (n_fields - 1) + bw)
+            width, height = fields_dimension, values_dimension
+        else:
+            values_dimension = int(bubbles_gap * (n_vals - 1) + bw)
+            fields_dimension = int(labels_gap * (n_fields - 1) + bh)
+            width, height = values_dimension, fields_dimension
         self.prepareGeometryChange()
-        self._rect = QtCore.QRectF(0, 0, max(30, w), max(30, h))  # CHANGED
-        self.setPos(float(ox), float(oy))  # CHANGED
+        self._rect = QtCore.QRectF(0, 0, max(30, width), max(30, height))
+        self.setPos(float(ox), float(oy))
 
     def update_model_from_item(self):
+        """Update origin and derive gaps from current rect dimensions (inverse of calculate_block_dimensions)."""
         fb = self.model.get_block(self.name)
         r = self._rect
-        fb["origin"] = [int(self.pos().x()), int(self.pos().y())]  # CHANGED
-        fb["bubblesGap"] = int(max(30, r.width()))
-        fb["labelsGap"] = int(max(30, r.height()))
+        fb["origin"] = [int(self.pos().x()), int(self.pos().y())]
+        direction = fb.get("direction", "horizontal")
+        vals: List[str] = fb.get("bubbleValues", []) or []
+        labels: List[str] = fb.get("fieldLabels", []) or []
+        n_vals = max(1, len(vals))
+        n_fields = max(1, len(labels))
+        bw, bh = fb.get("bubbleDimensions", self.model.template.get("bubbleDimensions", [20, 20]))
+        try:
+            bw = float(bw)
+            bh = float(bh)
+        except Exception:
+            bw, bh = 20.0, 20.0
+        width = float(r.width())
+        height = float(r.height())
+        if direction == "vertical":
+            fields_dimension = width
+            values_dimension = height
+            fb["labelsGap"] = int(round((fields_dimension - bw) / (n_fields - 1))) if n_fields > 1 else int(bw)
+            fb["bubblesGap"] = int(round((values_dimension - bh) / (n_vals - 1))) if n_vals > 1 else int(bh)
+        else:
+            values_dimension = width
+            fields_dimension = height
+            fb["bubblesGap"] = int(round((values_dimension - bw) / (n_vals - 1))) if n_vals > 1 else int(bw)
+            fb["labelsGap"] = int(round((fields_dimension - bh) / (n_fields - 1))) if n_fields > 1 else int(bh)
 
     # New: handle creation and positioning
     def _create_handles(self):
@@ -602,7 +677,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(self.view)
 
         # Load and preprocess image (cropped, no downscale/blur)
-        processed = run_preprocessors_for_editor(self.model.template, image_path, template_path.parent)
+        processed = run_preprocessors_for_editor(template_path, image_path)
         if processed is not None:
             pixmap = np_gray_to_qpixmap(processed)
         else:
@@ -738,18 +813,30 @@ class MainWindow(QtWidgets.QMainWindow):
         out = self.model.save_as_edited()
         QtWidgets.QMessageBox.information(self, "Saved", f"Saved:\n{out}")
 
-def parse_args(argv: List[str]) -> Tuple[Path, Optional[Path]]:
+def parse_args(argv: List[str]) -> Tuple[Optional[Path], Optional[Path]]:
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--template", required=True, help="Path to template.json")
-    ap.add_argument("--image", required=False, help="Path to a (cropped) image. Defaults to first under ./inputs")
+    ap.add_argument("--template", required=False, help="Path to template.json. If omitted, auto-detect under ./inputs")
+    ap.add_argument("--image", required=False, help="Path to an image. If omitted, auto-detect (preferring same folder as template)")
     args = ap.parse_args(argv)
-    t = Path(args.template).resolve()
+    t = Path(args.template).resolve() if args.template else None
     img = Path(args.image).resolve() if args.image else None
     return t, img
 
 def main():
     template_path, image_path = parse_args(sys.argv[1:])
+    # Auto-detect template and image like main.py workflow if not provided
+    if template_path is None:
+        template_path = find_first_template_under(PROJECT_ROOT / "inputs")
+        if template_path is None:
+            raise SystemExit("No template.json provided and none found under ./inputs")
+    # Prefer image under the template's directory; fallback to first under ./inputs
+    if image_path is None:
+        local_img = find_first_image_under(template_path.parent)
+        image_path = local_img if local_img is not None else find_first_image_under(PROJECT_ROOT / "inputs")
+        if image_path is None:
+            raise SystemExit("No image provided and none found under ./inputs")
+
     app = QtWidgets.QApplication(sys.argv)
     # Dark-ish palette for contrast
     palette = app.palette()
