@@ -23,7 +23,7 @@ Optional (only for image helpers): opencv-python
 
 Run
 - From repo root:
-  - python3 -m src.ui.qt_editor --template samples/sample1/template.json --image samples/sample1/page1.png
+  - python3 -m src.ui.qt_editor --template samples/sample1/template.json --image samples/sample1/MobileCamera/sheet1.png
 
 Notes
 - If --image is omitted, the editor loads the first image found under ./inputs/.
